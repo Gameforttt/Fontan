@@ -5,10 +5,10 @@ import re
 import sqlite3
 import time
 from datetime import datetime, timedelta
-from flask import Flask, request, redirect, session, send_from_directory, jsonify, render_template_string, url_for
+from flask import Flask, request, redirect, session, send_from_directory, jsonify, render_template_string, url_for, abort
 from werkzeug.utils import secure_filename
 from gtts import gTTS
-import requests  # для скачивания по ссылке
+import requests  # для скачивания по ссылке и геолокации
 
 # ========== Конфигурация ==========
 APP_SECRET = "supersecretkey_replace"        # поменяй на свой секрет
@@ -63,6 +63,8 @@ def init_db():
             current_track_id INTEGER,
             current_display_name TEXT,
             volume REAL DEFAULT 0.6,
+            schedule_active INTEGER DEFAULT 0, -- NEW: флаг активации расписания
+            current_schedule_pos INTEGER DEFAULT 0, -- NEW: текущая позиция в расписании
             FOREIGN KEY (current_track_id) REFERENCES tracks(id)
         )
     """)
@@ -113,6 +115,19 @@ def init_db():
             rejected INTEGER DEFAULT 0
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS schedule ( -- NEW: таблица для расписания треков
+            id INTEGER PRIMARY KEY,
+            track_id INTEGER,
+            position INTEGER,
+            FOREIGN KEY (track_id) REFERENCES tracks(id)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS blocked_countries ( -- NEW: таблица для заблокированных стран
+            code TEXT PRIMARY KEY -- ISO2 код, e.g. 'RU'
+        )
+    """)
     c.execute("INSERT OR IGNORE INTO state (id, volume) VALUES (1, 0.6)")
     db.commit()
     db.close()
@@ -135,6 +150,17 @@ def migrate_db():
         cur.execute("ALTER TABLE chat_messages ADD COLUMN deleted INTEGER DEFAULT 0")
     # add_track_requests
     cur.execute("CREATE TABLE IF NOT EXISTS add_track_requests (id INTEGER PRIMARY KEY, username TEXT, url_or_file TEXT, display_name TEXT, requested_at TEXT, approved INTEGER DEFAULT 0, rejected INTEGER DEFAULT 0)")
+    # NEW: schedule
+    cur.execute("CREATE TABLE IF NOT EXISTS schedule (id INTEGER PRIMARY KEY, track_id INTEGER, position INTEGER, FOREIGN KEY (track_id) REFERENCES tracks(id))")
+    # NEW: blocked_countries
+    cur.execute("CREATE TABLE IF NOT EXISTS blocked_countries (code TEXT PRIMARY KEY)")
+    # NEW: schedule_active in state
+    cur.execute("PRAGMA table_info(state)")
+    cols = {r['name'] for r in cur.fetchall()}
+    if 'schedule_active' not in cols:
+        cur.execute("ALTER TABLE state ADD COLUMN schedule_active INTEGER DEFAULT 0")
+    if 'current_schedule_pos' not in cols:
+        cur.execute("ALTER TABLE state ADD COLUMN current_schedule_pos INTEGER DEFAULT 0")
     conn.commit()
     conn.close()
 
@@ -167,6 +193,35 @@ def log_action(level, message):
             f.write(f"[{datetime.utcnow().isoformat()}] {level.upper()}: {message}\n")
     except:
         pass
+
+# NEW: Функция для получения страны по IP (используем ipapi.co)
+def get_country_from_ip(ip):
+    try:
+        response = requests.get(f"https://ipapi.co/{ip}/country_code/")
+        if response.status_code == 200:
+            return response.text.strip().upper()
+        else:
+            log_action("error", f"GeoIP API error: {response.status_code}")
+            return None
+    except Exception as e:
+        log_action("error", f"GeoIP request failed: {e}")
+        return None
+
+# ========== Глобальная проверка блокировки по стране ==========
+# NEW: Перед каждым запросом проверяем страну (кроме админ-панели)
+@app.before_request
+def check_country_block():
+    if request.path.startswith('/admin'):  # Не блокируем админку
+        return
+    ip = request.remote_addr
+    country = get_country_from_ip(ip)
+    if country:
+        conn = get_db()
+        blocked = conn.execute("SELECT code FROM blocked_countries WHERE code = ?", (country,)).fetchone()
+        conn.close()
+        if blocked:
+            log_action("warn", f"Blocked access from {ip} ({country})")
+            abort(403, "Доступ из вашей страны запрещен.")
 
 # ========== Голосовое приветствие ==========
 def generate_greeting(display_name, radio_name="Радио Фонтан"):
@@ -448,6 +503,54 @@ def admin_panel():
             conn.commit()
             conn.close()
             message = "Сообщение в чате удалено."
+        # NEW: Управление расписанием
+        if request.form.get('add_to_schedule'):
+            track_id = int(request.form.get('add_to_schedule'))
+            conn = get_db()
+            max_pos = conn.execute("SELECT MAX(position) FROM schedule").fetchone()[0] or 0
+            conn.execute("INSERT INTO schedule (track_id, position) VALUES (?, ?)", (track_id, max_pos + 1))
+            conn.commit()
+            conn.close()
+            message = "Трек добавлен в расписание."
+        
+        if request.form.get('remove_from_schedule'):
+            sched_id = int(request.form.get('remove_from_schedule'))
+            conn = get_db()
+            conn.execute("DELETE FROM schedule WHERE id = ?", (sched_id,))
+            conn.commit()
+            conn.close()
+            message = "Трек удален из расписания."
+        
+        if request.form.get('toggle_schedule'):
+            active = int(request.form.get('toggle_schedule'))
+            conn = get_db()
+            conn.execute("UPDATE state SET schedule_active = ? WHERE id = 1", (active,))
+            conn.commit()
+            conn.close()
+            message = "Расписание " + ("активировано" if active else "деактивировано")
+        
+        # NEW: Управление блокировкой стран
+        if request.form.get('add_blocked_country'):
+            code = request.form.get('add_blocked_country').upper().strip()
+            if len(code) == 2:
+                conn = get_db()
+                try:
+                    conn.execute("INSERT INTO blocked_countries (code) VALUES (?)", (code,))
+                    conn.commit()
+                    message = f"Страна {code} заблокирована."
+                except sqlite3.IntegrityError:
+                    message = "Страна уже заблокирована."
+                conn.close()
+            else:
+                message = "Неверный код страны (должен быть 2 буквы, e.g. RU)."
+        
+        if request.form.get('remove_blocked_country'):
+            code = request.form.get('remove_blocked_country')
+            conn = get_db()
+            conn.execute("DELETE FROM blocked_countries WHERE code = ?", (code,))
+            conn.commit()
+            conn.close()
+            message = f"Страна {code} разблокирована."
 
     conn = get_db()
     tracks = conn.execute("SELECT * FROM tracks ORDER BY uploaded_at DESC").fetchall()
@@ -470,31 +573,78 @@ def admin_panel():
     requests = conn.execute("SELECT r.id, r.username, r.track_id, t.display_name, r.requested_at, r.approved FROM requests r JOIN tracks t ON r.track_id = t.id ORDER BY r.requested_at DESC LIMIT 50").fetchall()
     add_requests = conn.execute("SELECT * FROM add_track_requests ORDER BY requested_at DESC LIMIT 50").fetchall()
     chat_msgs = conn.execute("SELECT * FROM chat_messages ORDER BY created_at DESC LIMIT 50").fetchall()
+    schedule = conn.execute("SELECT s.id, t.display_name, s.position FROM schedule s JOIN tracks t ON s.track_id = t.id ORDER BY s.position").fetchall()
+    blocked_countries = conn.execute("SELECT code FROM blocked_countries").fetchall()
     conn.close()
-    return render_template_string(ADMIN_TEMPLATE, tracks=tracks, message=message, state=state, users=users, online=online, reports=reports, likes_stats=likes_stats, requests=requests, add_requests=add_requests, chat_msgs=chat_msgs)
+    return render_template_string(ADMIN_TEMPLATE, tracks=tracks, message=message, state=state, users=users, online=online, reports=reports, likes_stats=likes_stats, requests=requests, add_requests=add_requests, chat_msgs=chat_msgs,
+                                  schedule=schedule, blocked_countries=blocked_countries)  # NEW: передаем schedule и blocked_countries
 
 # ========== API: next ==========
 @app.route('/api/next', methods=['POST'])
 def api_next():
     conn = get_db()
-    rows = conn.execute("SELECT id FROM tracks").fetchall()
-    if not rows:
-        conn.close()
-        return jsonify({"ok": False, "error": "Нет треков"}), 400
-    ids = [r['id'] for r in rows]
     state = conn.execute("SELECT * FROM state WHERE id = 1").fetchone()
-    current = state['current_track_id']
-    candidates = [i for i in ids if i != current]
-    if not candidates:
-        candidates = ids
-    new_id = random.choice(candidates)
-    greeting = set_current_track(new_id)
+    if state['schedule_active']:  # NEW: Если расписание активно
+        # Берем следующий из расписания без повторений
+        sched_rows = conn.execute("SELECT track_id, position FROM schedule ORDER BY position").fetchall()
+        if not sched_rows:
+            conn.close()
+            return jsonify({"ok": False, "error": "Нет треков в расписании"}), 400
+        
+        current_pos = state['current_schedule_pos']
+        if current_pos >= len(sched_rows) - 1:
+            # Конец расписания
+            conn.close()
+            return jsonify({"ok": False, "end_of_schedule": True})
+        
+        new_pos = current_pos + 1
+        new_id = sched_rows[new_pos]['track_id']
+        
+        greeting = set_current_track(new_id)
+        conn.execute("UPDATE state SET current_schedule_pos = ? WHERE id = 1", (new_pos,))
+        conn.commit()
+    else:
+        # Старый случайный выбор (без изменений)
+        rows = conn.execute("SELECT id FROM tracks").fetchall()
+        if not rows:
+            conn.close()
+            return jsonify({"ok": False, "error": "Нет треков"}), 400
+        ids = [r['id'] for r in rows]
+        current = state['current_track_id']
+        candidates = [i for i in ids if i != current]
+        if not candidates:
+            candidates = ids
+        new_id = random.choice(candidates)
+        greeting = set_current_track(new_id)
+    
     row = conn.execute("SELECT filename, display_name FROM tracks WHERE id = ?", (new_id,)).fetchone()
     conn.close()
     filename = row['filename']
     display_name = row['display_name']
     ts = int(time.time() * 1000)
     return jsonify({"ok": True, "id": new_id, "filename": filename, "display_name": display_name, "greeting": greeting, "ts": ts})
+
+# NEW: API для сброса позиции расписания (повторить)
+@app.route('/api/reset_schedule_pos', methods=['POST'])
+@login_required
+def api_reset_schedule_pos():
+    conn = get_db()
+    conn.execute("UPDATE state SET current_schedule_pos = 0 WHERE id = 1")
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+# NEW: API для поиска треков
+@app.route('/api/search_tracks', methods=['GET'])
+def api_search_tracks():
+    query = request.args.get('q', '').strip()
+    if not query:
+        return jsonify({"ok": False, "error": "Пустой запрос"}), 400
+    conn = get_db()
+    rows = conn.execute("SELECT id, display_name, filename FROM tracks WHERE display_name LIKE ? ORDER BY uploaded_at DESC", (f"%{query}%",)).fetchall()
+    conn.close()
+    results = [{"id": r['id'], "display_name": r['display_name'], "filename": r['filename']} for r in rows]
+    return jsonify({"ok": True, "results": results})
 
 # ========== API: like ==========
 @app.route('/api/like', methods=['POST'])
@@ -1218,6 +1368,64 @@ ADMIN_TEMPLATE = """
       </div>
     </section>
 
+    <!-- NEW: Раздел для расписания -->
+    <section class="mb-6 fade-in">
+      <h2 class="font-semibold mb-3 text-lg">Расписание треков (активно: {{ 'Да' if state['schedule_active'] else 'Нет' }})</h2>
+      <form method="POST" class="mb-4">
+        <button name="toggle_schedule" value="{{ 1 if not state['schedule_active'] else 0 }}" class="bg-indigo-600 text-white p-2 rounded-lg hover:bg-indigo-700 transition">
+          {{ 'Деактивировать' if state['schedule_active'] else 'Активировать' }} расписание
+        </button>
+      </form>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left border-collapse">
+          <thead class="bg-purple-100"><tr><th class="p-3">Позиция</th><th class="p-3">Трек</th><th class="p-3">Действия</th></tr></thead>
+          <tbody>
+          {% for s in schedule %}
+            <tr class="border-t">
+              <td class="p-3">{{ s['position'] }}</td>
+              <td class="p-3">{{ s['display_name'] }}</td>
+              <td class="p-3">
+                <form method="POST" style="display:inline" onsubmit="return confirm('Удалить из расписания?')">
+                  <input type="hidden" name="remove_from_schedule" value="{{ s['id'] }}" />
+                  <button class="px-3 py-1 rounded bg-red-500 text-white hover:bg-red-600 transition">Удалить</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <h3 class="font-semibold mt-4 mb-2">Добавить трек в расписание</h3>
+      <form method="POST" class="flex gap-2">
+        <select name="add_to_schedule" class="p-2 border rounded-lg">
+          {% for t in tracks %}
+            <option value="{{ t['id'] }}">{{ t['display_name'] }}</option>
+          {% endfor %}
+        </select>
+        <button class="bg-green-500 text-white p-2 rounded-lg hover:bg-green-600 transition">Добавить</button>
+      </form>
+    </section>
+
+    <!-- NEW: Раздел для блокировки стран -->
+    <section class="mb-6 fade-in">
+      <h2 class="font-semibold mb-3 text-lg">Заблокированные страны</h2>
+      <ul class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4">
+      {% for bc in blocked_countries %}
+        <li class="bg-red-100 p-2 rounded-lg flex justify-between">
+          {{ bc['code'] }}
+          <form method="POST" style="display:inline">
+            <input type="hidden" name="remove_blocked_country" value="{{ bc['code'] }}" />
+            <button class="text-red-600 hover:underline">Удалить</button>
+          </form>
+        </li>
+      {% endfor %}
+      </ul>
+      <form method="POST" class="flex gap-2">
+        <input name="add_blocked_country" placeholder="Код страны (e.g. RU)" class="p-2 border rounded-lg" />
+        <button class="bg-red-500 text-white p-2 rounded-lg hover:bg-red-600 transition">Заблокировать</button>
+      </form>
+    </section>
+
     <section class="fade-in">
       <h2 class="font-semibold mb-3 text-lg">Список треков</h2>
       <div class="overflow-x-auto">
@@ -1238,6 +1446,10 @@ ADMIN_TEMPLATE = """
                 <form method="POST" style="display:inline" onsubmit="return confirm('Удалить?')">
                   <input type="hidden" name="delete_id" value="{{ t['id'] }}" />
                   <button class="bg-red-500 text-white px-3 py-2 rounded-lg hover:bg-red-600 transition">Удалить</button>
+                </form>
+                <form method="POST" style="display:inline">
+                  <input type="hidden" name="add_to_schedule" value="{{ t['id'] }}" />
+                  <button class="bg-purple-500 text-white px-3 py-2 rounded-lg hover:bg-purple-600 transition">В расписание</button>
                 </form>
               </td>
             </tr>
@@ -1327,6 +1539,12 @@ RADIO_TEMPLATE = """
       <p id="status" class="text-gray-600 text-center">Статус: готов</p>
     </div>
 
+    <!-- NEW: Кнопка для повторения расписания (скрыта по умолчанию) -->
+    <div id="repeatContainer" class="mb-6 hidden text-center">
+      <p class="text-red-600 mb-2">Ожидание песен</p>
+      <button id="repeatBtn" class="btn bg-green-500 text-white hover:bg-green-600">Хотите ещё раз послушать?</button>
+    </div>
+
     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
       <div class="fade-in">
         <h3 class="font-semibold mb-3 text-lg">Последние треки</h3>
@@ -1341,6 +1559,22 @@ RADIO_TEMPLATE = """
           <button id="chatSend" class="btn bg-indigo-600 text-white hover:bg-indigo-700">Отправить</button>
         </div>
       </div>
+    </div>
+
+    <!-- NEW: Поиск треков -->
+    <div class="mb-6">
+      <h3 class="font-semibold mb-3 text-lg">Поиск треков</h3>
+      <div class="flex gap-2">
+        <input id="searchInput" placeholder="Название трека..." class="flex-1 p-2 border rounded-lg" />
+        <button id="searchBtn" class="btn bg-indigo-600 text-white hover:bg-indigo-700">Найти</button>
+      </div>
+      <ul id="searchResults" class="list-disc pl-6 text-sm text-gray-700 max-h-48 overflow-y-auto mt-2"></ul>
+    </div>
+
+    <!-- NEW: Топ-чарт -->
+    <div class="mb-6 fade-in">
+      <h3 class="font-semibold mb-3 text-lg">Топ-10 треков по лайкам</h3>
+      <ul id="topChart" class="list-decimal pl-6 text-sm text-gray-700"></ul>
     </div>
 
     <div class="flex justify-between items-center mt-6">
@@ -1379,6 +1613,8 @@ RADIO_TEMPLATE = """
   const chatBox = document.getElementById('chatBox');
   const chatInput = document.getElementById('chatInput');
   const chatSend = document.getElementById('chatSend');
+  const repeatContainer = document.getElementById('repeatContainer');
+  const repeatBtn = document.getElementById('repeatBtn');
 
   // loading spinner
   const loadingSpinner = document.createElement('div');
@@ -1429,6 +1665,7 @@ RADIO_TEMPLATE = """
   let greetingPlaying = false;
   let loadingNext = false;
   let currentTrackId = {{ track_id }};
+  let scheduleEnded = false;
 
   music.onended = async () => {
     status.innerText = "💤 Трек закончился — запрашиваем следующий...";
@@ -1450,7 +1687,7 @@ RADIO_TEMPLATE = """
   };
 
   async function fetchNext() {
-    if (loadingNext) return;
+    if (loadingNext || scheduleEnded) return;
     loadingNext = true;
     nextBtn.disabled = true;
     status.classList.add('pulse');
@@ -1473,6 +1710,11 @@ RADIO_TEMPLATE = """
         greetingPlaying = true;
         loadRecent();
         updateLikes();
+      } else if (data.end_of_schedule) {
+        status.innerText = "Ожидание песен";
+        repeatContainer.classList.remove('hidden');
+        nextBtn.disabled = true;
+        scheduleEnded = true;
       } else {
         status.innerText = "Ошибка сервера при получении следующего трека";
       }
@@ -1480,7 +1722,6 @@ RADIO_TEMPLATE = """
       status.innerText = "Сетевая ошибка при получении следующего трека";
     } finally {
       loadingNext = false;
-      nextBtn.disabled = false;
       status.classList.remove('pulse');
       loadingSpinner.style.display = 'none';
     }
@@ -1582,7 +1823,7 @@ RADIO_TEMPLATE = """
         alert("Ошибка: " + (data.error || 'unknown'));
       }
     } catch (e) {
-      alert("Ошибка сети");
+        alert("Ошибка сети");
     }
   });
 
@@ -1658,6 +1899,75 @@ RADIO_TEMPLATE = """
   }
   setInterval(updateTime, 1000);
   updateTime();
+
+  // NEW: Поиск треков
+  const searchInput = document.getElementById('searchInput');
+  const searchBtn = document.getElementById('searchBtn');
+  const searchResults = document.getElementById('searchResults');
+
+  searchBtn.addEventListener('click', async () => {
+    const q = searchInput.value.trim();
+    if (!q) return;
+    try {
+      const res = await fetch(`/api/search_tracks?q=${encodeURIComponent(q)}`);
+      const data = await res.json();
+      if (data.ok) {
+        searchResults.innerHTML = '';
+        data.results.forEach(r => {
+          const li = document.createElement('li');
+          li.innerHTML = `${r.display_name} <button class="text-green-600 hover:underline" onclick="requestTrack(${r.id})">Запросить</button>`;
+          searchResults.appendChild(li);
+        });
+      }
+    } catch (e) {}
+  });
+
+  async function requestTrack(id) {
+    if (confirm("Запросить этот трек?")) {
+      try {
+        const res = await fetch('/api/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ track_id: id }) });
+        const data = await res.json();
+        if (data.ok) alert("Запрос отправлен.");
+        else alert(data.error);
+      } catch (e) { alert("Ошибка"); }
+    }
+  }
+
+  // NEW: Загрузка топ-чарта
+  async function loadTopChart() {
+    try {
+      const res = await fetch('/api/recent');
+      const data = await res.json();
+      if (data.ok) {
+        const top = data.recent.sort((a, b) => b.likes - a.likes).slice(0, 10);
+        const topChart = document.getElementById('topChart');
+        topChart.innerHTML = '';
+        top.forEach((r, i) => {
+          const li = document.createElement('li');
+          li.innerText = `${i+1}. ${r.display_name} (${r.likes} ❤)`;
+          topChart.appendChild(li);
+        });
+      }
+    } catch (e) {}
+  }
+  loadTopChart();
+  setInterval(loadTopChart, 60000);  // Обновлять каждую минуту
+
+  // NEW: Обработка повторения расписания
+  repeatBtn.addEventListener('click', async () => {
+    try {
+      const res = await fetch('/api/reset_schedule_pos', { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        repeatContainer.classList.add('hidden');
+        scheduleEnded = false;
+        nextBtn.disabled = false;
+        await fetchNext();
+      }
+    } catch (e) {
+      status.innerText = "Ошибка при повторении расписания";
+    }
+  });
 
   loadRecent();
   loadChat();
